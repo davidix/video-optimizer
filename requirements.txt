@@ -1,0 +1,7 @@
+# FFmpeg must be installed on the system:
+#   macOS:  brew install ffmpeg
+#   Ubuntu: sudo apt install ffmpeg
+
+rich>=13.0
+typer>=0.12
+watchdog>=4.0
