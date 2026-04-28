@@ -22,6 +22,18 @@ source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+## Web UI (Flask)
+
+Bootstrap + drag-and-drop multi-file uploads; same encoding as the CLI (`optimize_file`). **Advanced** options (container mp4/mkv, FFmpeg `-preset`, audio policy, CRF/codec overrides, keep-if-larger, hwaccel) use the same `apply_encode_overrides` rules as `optimize`. Each queued job has **Cancel** and shows **Before / After** sizes. Outputs go to `web_outputs/<job_id>/` and can be downloaded from the browser.
+
+```bash
+source venv/bin/activate
+python web.py
+# Open http://127.0.0.1:5000
+```
+
+Set `PORT=8080` to listen on another port.
+
 ## Usage
 
 The CLI is **`vopt`**-style: subcommands (`optimize`, `info`, `presets`, `watch`). For convenience, paths without a subcommand are treated as **`optimize`** (same as before).
@@ -39,6 +51,10 @@ python video_optimizer.py video.mp4
 # Light / aggressive presets
 python video_optimizer.py optimize -p light video.mp4
 python video_optimizer.py optimize -p aggressive video.mp4
+
+# Output container, audio, FFmpeg encoder speed (also on `watch`)
+python video_optimizer.py optimize clip.mp4 -f mkv --audio copy --ffmpeg-preset slow
+python video_optimizer.py optimize clip.mp4 --audio aac --audio-bitrate 192k --container mp4
 
 # Batch folder, recursive, custom output directory
 python video_optimizer.py optimize -r ./videos/ -o ./output/
@@ -98,9 +114,13 @@ python video_optimizer.py watch ./incoming/ -o ./out/
 | `--codec` | `h264` or `h265` (maps to libx264 / libx265). |
 | `--dry-run` | Probe only; print planned output path and ffmpeg command. |
 | `--json` | Print JSON summary to stdout. |
-| `--skip-existing` | Skip if `{stem}_optimized.mp4` already exists in the output dir. |
+| `--skip-existing` | Skip if `{stem}_optimized` with the chosen extension already exists in the output dir. |
 | `-j`, `--workers` | Parallel jobs (default: 1). |
 | `--plain`, `--no-color` | Disable colors and Rich progress. |
+| `-f`, `--container` | Output container for H.264/H.265: `mp4` (default, `+faststart`) or `mkv`. |
+| `--ffmpeg-preset` | Override FFmpeg encoder `-preset` (e.g. `slow`, `veryfast`). |
+| `--audio` | `preset` (recipe default), `copy`, `aac`, or `none` (strip). |
+| `--audio-bitrate` | AAC bitrate when using `--audio aac`, or override when preset uses AAC (e.g. `128k`). |
 
 ## How it works
 

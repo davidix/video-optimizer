@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Video Optimizer</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+      integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+      crossorigin="anonymous"
+    />
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body class="bg-light">
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
+      <div class="container">
+        <span class="navbar-brand mb-0 h1">Video Optimizer</span>
+        <span class="navbar-text text-secondary small">CRF H.265/H.264 · same engine as CLI</span>
+      </div>
+    </nav>
+
+    <main class="container pb-5">
+      {% if not ffmpeg_ok %}
+      <div class="alert alert-warning" role="alert">
+        <strong>FFmpeg not detected</strong> on this machine’s PATH. Install FFmpeg (and ffprobe), then restart the
+        server. Uploads will fail until then.
+      </div>
+      {% endif %}
+
+      <div class="row g-4">
+        <div class="col-lg-4">
+          <div class="card shadow-sm">
+            <div class="card-header">Settings</div>
+            <div class="card-body">
+              <label for="preset" class="form-label">Preset</label>
+              <select id="preset" class="form-select" name="preset">
+                {% for p in presets %}
+                <option value="{{ p.name }}" title="{{ p.description }}" {% if p.name == 'medium' %}selected{% endif %}>{{ p.name }}</option>
+                {% endfor %}
+              </select>
+              <p class="form-text small text-muted mt-2 mb-0">
+                light · medium · aggressive — same as <code>python video_optimizer.py optimize -p …</code>
+              </p>
+            </div>
+          </div>
+
+          <div class="card shadow-sm mt-3">
+            <div class="card-header py-2">
+              <button
+                class="btn btn-link btn-sm text-decoration-none p-0 text-body"
+                type="button"
+                data-bs-toggle="collapse"
+                data-bs-target="#advanced-collapse"
+                aria-expanded="false"
+                aria-controls="advanced-collapse"
+              >
+                Advanced options
+              </button>
+            </div>
+            <div id="advanced-collapse" class="collapse">
+              <div class="card-body pt-0 small">
+                <div class="mb-2">
+                  <label class="form-label mb-0" for="container">Container</label>
+                  <select id="container" class="form-select form-select-sm" name="container">
+                    {% for c in containers %}
+                    <option value="{{ c }}" {% if c == 'mp4' %}selected{% endif %}>.{{ c }}</option>
+                    {% endfor %}
+                  </select>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label mb-0" for="ffmpeg_preset">FFmpeg -preset</label>
+                  <select id="ffmpeg_preset" class="form-select form-select-sm" name="ffmpeg_preset">
+                    <option value="" selected>(from recipe)</option>
+                    {% for fp in ffmpeg_presets %}
+                    <option value="{{ fp }}">{{ fp }}</option>
+                    {% endfor %}
+                  </select>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label mb-0" for="codec">Video codec</label>
+                  <select id="codec" class="form-select form-select-sm" name="codec">
+                    <option value="" selected>(from recipe)</option>
+                    <option value="h265">H.265 (libx265)</option>
+                    <option value="h264">H.264 (libx264)</option>
+                  </select>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label mb-0" for="crf">CRF override</label>
+                  <input type="number" min="0" max="51" class="form-control form-control-sm" id="crf" name="crf" placeholder="empty = recipe default" />
+                </div>
+                <div class="mb-2">
+                  <label class="form-label mb-0" for="audio">Audio</label>
+                  <select id="audio" class="form-select form-select-sm" name="audio">
+                    <option value="preset" selected>From recipe</option>
+                    <option value="copy">Copy</option>
+                    <option value="aac">AAC (re-encode)</option>
+                    <option value="none">None (strip)</option>
+                  </select>
+                </div>
+                <div class="mb-2" id="audio-bitrate-wrap">
+                  <label class="form-label mb-0" for="audio_bitrate">AAC bitrate</label>
+                  <input type="text" class="form-control form-control-sm" id="audio_bitrate" name="audio_bitrate" placeholder="128k" value="128k" />
+                </div>
+                <div class="form-check mb-1">
+                  <input class="form-check-input" type="checkbox" id="keep" name="keep" />
+                  <label class="form-check-label" for="keep">Keep output if not smaller than source</label>
+                </div>
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="hwaccel" name="hwaccel" />
+                  <label class="form-check-label" for="hwaccel">FFmpeg <code>-hwaccel auto</code> (decode)</label>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-lg-8">
+          <div class="card shadow-sm" id="drop-card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+              <span>Files</span>
+              <button type="button" class="btn btn-sm btn-outline-secondary" id="browse-btn">Browse…</button>
+            </div>
+            <div class="card-body p-0">
+              <div
+                id="dropzone"
+                class="dropzone text-center text-muted p-5 border border-2 border-dashed rounded-2 m-3"
+                tabindex="0"
+              >
+                <p class="mb-1"><strong>Drag and drop</strong> videos here</p>
+                <p class="small mb-0">or click “Browse…” — multiple files supported</p>
+              </div>
+              <input type="file" id="file-input" class="d-none" multiple accept="video/*,.mkv,.avi,.mov,.webm,.flv,.wmv,.m4v,.ts" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <h2 class="h5 mt-4 mb-3">Queue</h2>
+      <div id="jobs-list" class="d-flex flex-column gap-3"></div>
+    </main>
+
+    <script
+      id="app-config"
+      type="application/json"
+    >{{ {"supportedExtensions": supported_extensions } | tojson }}</script>
+    <script
+      src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+      integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
+      crossorigin="anonymous"
+    ></script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

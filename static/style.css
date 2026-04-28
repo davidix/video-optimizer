@@ -1,0 +1,35 @@
+.dropzone {
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.dropzone:hover,
+.dropzone:focus {
+  background-color: rgba(13, 110, 253, 0.06);
+  border-color: rgba(13, 110, 253, 0.45) !important;
+}
+
+.dropzone.dragover {
+  background-color: rgba(25, 135, 84, 0.08);
+  border-color: rgba(25, 135, 84, 0.55) !important;
+}
+
+#jobs-list .card {
+  border-left: 4px solid var(--bs-border-color);
+}
+
+#jobs-list .card.state-encoding {
+  border-left-color: var(--bs-primary);
+}
+
+#jobs-list .card.state-done {
+  border-left-color: var(--bs-success);
+}
+
+#jobs-list .card.state-error {
+  border-left-color: var(--bs-danger);
+}
+
+#jobs-list .card.state-cancelled {
+  border-left-color: var(--bs-secondary);
+}

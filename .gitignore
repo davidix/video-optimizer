@@ -5,3 +5,5 @@ __pycache__/
 .env
 .env.*
 *.mp4
+web_uploads/
+web_outputs/

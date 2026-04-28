@@ -53,6 +53,42 @@ HELP_CODEC = (
     "(libx264, wider compatibility). Default follows the chosen preset (H.265)."
 )
 
+HELP_CONTAINER = (
+    "Output container for H.264/H.265 encodes: [bold]mp4[/bold] (default, +faststart) or [bold]mkv[/bold]."
+)
+
+HELP_FFMPEG_PRESET = (
+    "Override FFmpeg encoder [bold]-preset[/bold] (speed vs compression): "
+    "ultrafast … veryslow. Default comes from the named [bold]-p[/bold] recipe."
+)
+
+HELP_AUDIO = (
+    "Audio: [bold]preset[/bold] (use the recipe’s copy/AAC policy); [bold]copy[/bold]; "
+    "[bold]aac[/bold] (re-encode); [bold]none[/bold] (strip audio / -an)."
+)
+
+HELP_AUDIO_BITRATE = (
+    "AAC bitrate when [bold]--audio aac[/bold] (e.g. [cyan]128k[/cyan]). "
+    "When [bold]--audio preset[/bold] and the recipe uses AAC, overrides that recipe’s bitrate."
+)
+
+ALLOWED_CONTAINERS = frozenset({"mp4", "mkv"})
+
+FFMPEG_PRESET_CHOICES = frozenset(
+    {
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+    }
+)
+
+
 PRESETS: dict[str, dict[str, Any]] = {
     "light": {
         "description": "Minimal compression, virtually lossless (CRF 18 / H.265)",
@@ -103,6 +139,7 @@ class EncodeResult:
     original_bytes: int
     new_bytes: int | None
     reduction_percent: float | None
+    cancelled: bool = False
 
     def to_json_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -111,12 +148,17 @@ class EncodeResult:
             "success": self.success,
             "skipped": self.skipped,
             "dry_run": self.dry_run,
+            "cancelled": self.cancelled,
             "error": self.error,
             "original_bytes": self.original_bytes,
             "new_bytes": self.new_bytes,
             "reduction_percent": self.reduction_percent,
         }
         return d
+
+
+class EncodeCancelled(Exception):
+    """Raised when encoding is stopped before FFmpeg exits successfully (e.g. user cancel)."""
 
 
 def fmt_size(nbytes: int) -> str:
@@ -193,6 +235,72 @@ def check_encoder(codec: str) -> bool:
     return codec in result.stdout
 
 
+def output_suffix(preset_cfg: dict[str, Any]) -> str:
+    c = str(preset_cfg.get("container", "mp4")).lower()
+    if c not in ALLOWED_CONTAINERS:
+        raise ValueError(f"Invalid container {c!r} (allowed: {', '.join(sorted(ALLOWED_CONTAINERS))})")
+    return f".{c}"
+
+
+def apply_encode_overrides(
+    base_cfg: dict[str, Any],
+    *,
+    crf: int | None = None,
+    codec: str | None = None,
+    ffmpeg_preset: str | None = None,
+    audio_mode: str = "preset",
+    audio_bitrate: str | None = None,
+    container: str | None = None,
+) -> dict[str, Any]:
+    """Merge CLI/web tuning into a preset config copy. Raises ValueError on invalid input."""
+    out: dict[str, Any] = {**base_cfg}
+
+    if crf is not None:
+        if not 0 <= crf <= 51:
+            raise ValueError("CRF must be between 0 and 51.")
+        out["crf"] = crf
+
+    if codec:
+        if codec not in ("h264", "h265"):
+            raise ValueError("--codec must be h264 or h265.")
+        out["video_codec"] = "libx264" if codec == "h264" else "libx265"
+
+    if ffmpeg_preset is not None:
+        p = ffmpeg_preset.strip().lower()
+        if p not in FFMPEG_PRESET_CHOICES:
+            raise ValueError(
+                f"Unknown --ffmpeg-preset {ffmpeg_preset!r}. "
+                f"Choose one of: {', '.join(sorted(FFMPEG_PRESET_CHOICES))}"
+            )
+        out["preset"] = p
+
+    if audio_mode not in ("preset", "copy", "aac", "none"):
+        raise ValueError("--audio must be preset, copy, aac, or none.")
+
+    if audio_mode == "copy":
+        out["audio_strategy"] = "copy"
+        out.pop("audio_bitrate", None)
+    elif audio_mode == "aac":
+        out["audio_strategy"] = "compress"
+        out["audio_bitrate"] = str(audio_bitrate).strip() if audio_bitrate else "128k"
+    elif audio_mode == "none":
+        out["audio_strategy"] = "none"
+        out.pop("audio_bitrate", None)
+    elif audio_bitrate is not None and out.get("audio_strategy") == "compress":
+        out["audio_bitrate"] = str(audio_bitrate).strip()
+
+    if container is not None:
+        c = container.strip().lower()
+        if c not in ALLOWED_CONTAINERS:
+            raise ValueError(
+                f"Invalid --container {container!r}. Choose: {', '.join(sorted(ALLOWED_CONTAINERS))}."
+            )
+        out["container"] = c
+    out.setdefault("container", "mp4")
+
+    return out
+
+
 def build_ffmpeg_cmd(
     input_path: Path,
     output_path: Path,
@@ -234,7 +342,8 @@ def build_ffmpeg_cmd(
     else:
         cmd += ["-an"]
 
-    cmd += ["-movflags", "+faststart"]
+    if str(preset_cfg.get("container", "mp4")).lower() == "mp4":
+        cmd += ["-movflags", "+faststart"]
 
     cmd += [str(output_path)]
     return cmd, codec
@@ -264,7 +373,11 @@ def run_encode(
     progress: Progress | None = None,
     task_id: int | None = None,
     plain: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise EncodeCancelled()
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -272,6 +385,25 @@ def run_encode(
         text=True,
         bufsize=1,
     )
+
+    if cancel_event is not None and cancel_event.is_set():
+        process.terminate()
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise EncodeCancelled()
+
+    killer: threading.Thread | None = None
+    if cancel_event is not None:
+
+        def _terminate_when_cancelled() -> None:
+            cancel_event.wait()
+            if process.poll() is None:
+                process.terminate()
+
+        killer = threading.Thread(target=_terminate_when_cancelled, daemon=True)
+        killer.start()
 
     assert process.stderr is not None
 
@@ -292,6 +424,8 @@ def run_encode(
             pass
 
     rc = process.wait()
+    if cancel_event is not None and cancel_event.is_set():
+        raise EncodeCancelled()
     if progress is not None and task_id is not None:
         progress.update(task_id, completed=100.0)
 
@@ -301,7 +435,7 @@ def run_encode(
 
 
 def resolve_output_path(input_path: Path, output_dir: Path, preset_cfg: dict[str, Any]) -> Path:
-    suffix = ".mp4" if preset_cfg["video_codec"] in ("libx265", "libx264") else input_path.suffix
+    suffix = output_suffix(preset_cfg) if preset_cfg["video_codec"] in ("libx265", "libx264") else input_path.suffix
     stem = input_path.stem
     output_path = output_dir / f"{stem}_optimized{suffix}"
     counter = 1
@@ -313,7 +447,7 @@ def resolve_output_path(input_path: Path, output_dir: Path, preset_cfg: dict[str
 
 def first_candidate_output(input_path: Path, output_dir: Path, preset_cfg: dict[str, Any]) -> Path:
     """First output path (no numeric suffix) for --skip-existing."""
-    suffix = ".mp4" if preset_cfg["video_codec"] in ("libx265", "libx264") else input_path.suffix
+    suffix = output_suffix(preset_cfg) if preset_cfg["video_codec"] in ("libx265", "libx264") else input_path.suffix
     return output_dir / f"{input_path.stem}_optimized{suffix}"
 
 
@@ -351,8 +485,26 @@ def optimize_file(
     task_id: int | None = None,
     plain: bool = False,
     show_panels: bool = True,
+    cancel_event: threading.Event | None = None,
 ) -> EncodeResult:
     original_size = os.path.getsize(input_path)
+
+    def _cancelled_result() -> EncodeResult:
+        return EncodeResult(
+            input=str(input_path),
+            output=None,
+            success=False,
+            skipped=False,
+            dry_run=dry_run,
+            error="Cancelled",
+            original_bytes=original_size,
+            new_bytes=None,
+            reduction_percent=None,
+            cancelled=True,
+        )
+
+    if cancel_event is not None and cancel_event.is_set():
+        return _cancelled_result()
 
     if skip_existing:
         candidate = first_candidate_output(input_path, output_dir, preset_cfg)
@@ -376,8 +528,8 @@ def optimize_file(
                 error=None,
                 original_bytes=original_size,
                 new_bytes=os.path.getsize(candidate),
-                reduction_percent=None,
-            )
+            reduction_percent=None,
+        )
 
     try:
         info = probe(input_path)
@@ -397,6 +549,9 @@ def optimize_file(
             new_bytes=None,
             reduction_percent=None,
         )
+
+    if cancel_event is not None and cancel_event.is_set():
+        return _cancelled_result()
 
     output_path = resolve_output_path(input_path, output_dir, preset_cfg)
 
@@ -444,6 +599,9 @@ def optimize_file(
             reduction_percent=None,
         )
 
+    if cancel_event is not None and cancel_event.is_set():
+        return _cancelled_result()
+
     if show_panels and not plain:
         console.print(
             Panel(
@@ -454,7 +612,27 @@ def optimize_file(
         )
 
     try:
-        run_encode(cmd, info.duration, progress=progress, task_id=task_id, plain=plain)
+        run_encode(
+            cmd,
+            info.duration,
+            progress=progress,
+            task_id=task_id,
+            plain=plain,
+            cancel_event=cancel_event,
+        )
+    except EncodeCancelled:
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+        if show_panels and not plain:
+            console.print(
+                Panel("[dim]Encoding cancelled.[/dim]", title=input_path.name, border_style="yellow")
+            )
+        elif plain:
+            console.print(f"{input_path.name}: cancelled")
+        return _cancelled_result()
     except RuntimeError as e:
         if show_panels and not plain:
             console.print(Panel(f"[red]{e}[/red]", title=input_path.name, border_style="red"))
@@ -566,6 +744,10 @@ def run_optimize(
     workers: int,
     plain: bool,
     console: Console,
+    container: str | None = None,
+    ffmpeg_preset: str | None = None,
+    audio: str = "preset",
+    audio_bitrate: str | None = None,
 ) -> None:
     check_ffmpeg(console)
 
@@ -578,16 +760,19 @@ def run_optimize(
         console.print("[red]No supported video files found.[/red]")
         raise typer.Exit(1)
 
-    preset_cfg: dict[str, Any] = {**PRESETS[preset]}
-
-    if crf is not None:
-        if not 0 <= crf <= 51:
-            console.print("[red]Error:[/red] CRF must be between 0 and 51.")
-            raise typer.Exit(1)
-        preset_cfg["crf"] = crf
-
-    if codec:
-        preset_cfg["video_codec"] = "libx264" if codec == "h264" else "libx265"
+    try:
+        preset_cfg = apply_encode_overrides(
+            {**PRESETS[preset]},
+            crf=crf,
+            codec=codec,
+            ffmpeg_preset=ffmpeg_preset,
+            audio_mode=audio,
+            audio_bitrate=audio_bitrate,
+            container=container,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
 
     results: list[EncodeResult] = []
 
@@ -600,6 +785,9 @@ def run_optimize(
         meta.add_row("[bold]Preset[/bold]", preset)
         meta.add_row("[bold]Codec[/bold]", str(preset_cfg["video_codec"]))
         meta.add_row("[bold]CRF[/bold]", str(preset_cfg["crf"]))
+        meta.add_row("[bold]Container[/bold]", str(preset_cfg.get("container", "mp4")))
+        meta.add_row("[bold]FFmpeg -preset[/bold]", str(preset_cfg.get("preset", "—")))
+        meta.add_row("[bold]Audio[/bold]", str(preset_cfg.get("audio_strategy", "—")))
         meta.add_row("[bold]Workers[/bold]", str(workers))
         meta.add_row("[bold]Dry-run[/bold]", "yes" if dry_run else "no")
         console.print(meta)
@@ -680,7 +868,7 @@ def run_optimize(
         typer.echo(json.dumps(out, indent=2))
         return
 
-    if len(results) > 1 or any(r.skipped or r.dry_run or not r.success for r in results):
+    if len(results) > 1 or any(r.skipped or r.dry_run or r.cancelled or not r.success for r in results):
         summary = Table(title="Summary", box=box.ROUNDED, show_lines=True)
         summary.add_column("Input", style="cyan", no_wrap=True)
         summary.add_column("Status", style="bold")
@@ -704,6 +892,9 @@ def run_optimize(
                 total_new += r.new_bytes or r.original_bytes
             elif r.dry_run:
                 summary.add_row(Path(r.input).name, "[cyan]dry-run[/cyan]", fmt_size(r.original_bytes), "—", "—")
+                total_new += r.original_bytes
+            elif r.cancelled:
+                summary.add_row(Path(r.input).name, "[dim]cancelled[/dim]", fmt_size(r.original_bytes), "—", "—")
                 total_new += r.original_bytes
             elif not r.success:
                 summary.add_row(Path(r.input).name, "[red]failed[/red]", fmt_size(r.original_bytes), "—", "—")
@@ -907,6 +1098,19 @@ def optimize_cmd(
         "--no-color",
         help="Disable colors and Rich progress bars (logs/CI). Errors and dry-run still print plain text lines.",
     ),
+    container: str | None = typer.Option(
+        None,
+        "--container",
+        "-f",
+        help=HELP_CONTAINER,
+    ),
+    ffmpeg_preset: str | None = typer.Option(
+        None,
+        "--ffmpeg-preset",
+        help=HELP_FFMPEG_PRESET,
+    ),
+    audio: str = typer.Option("preset", "--audio", help=HELP_AUDIO),
+    audio_bitrate: str | None = typer.Option(None, "--audio-bitrate", help=HELP_AUDIO_BITRATE),
 ) -> None:
     """Re-encode inputs with a [bold]preset[/bold] (CRF + codec + audio policy).
 
@@ -922,6 +1126,9 @@ def optimize_cmd(
         raise typer.Exit(1)
     if codec and codec not in ("h264", "h265"):
         typer.echo("--codec must be h264 or h265", err=True)
+        raise typer.Exit(1)
+    if audio not in ("preset", "copy", "aac", "none"):
+        typer.echo("--audio must be preset, copy, aac, or none", err=True)
         raise typer.Exit(1)
 
     color_system = None if plain else "standard"
@@ -943,6 +1150,10 @@ def optimize_cmd(
         workers=workers,
         plain=plain,
         console=console,
+        container=container,
+        ffmpeg_preset=ffmpeg_preset,
+        audio=audio,
+        audio_bitrate=audio_bitrate,
     )
 
 
@@ -1035,6 +1246,19 @@ def watch_cmd(
         "--no-color",
         help="Same as [bold]optimize --plain[/bold]: no colors / no Rich progress.",
     ),
+    container: str | None = typer.Option(
+        None,
+        "--container",
+        "-f",
+        help=HELP_CONTAINER,
+    ),
+    ffmpeg_preset: str | None = typer.Option(
+        None,
+        "--ffmpeg-preset",
+        help=HELP_FFMPEG_PRESET,
+    ),
+    audio: str = typer.Option("preset", "--audio", help=HELP_AUDIO),
+    audio_bitrate: str | None = typer.Option(None, "--audio-bitrate", help=HELP_AUDIO_BITRATE),
 ) -> None:
     """Watch a directory tree and run [bold]optimize[/bold] when new videos appear.
 
@@ -1051,18 +1275,29 @@ def watch_cmd(
     if preset not in PRESETS:
         typer.echo(f"Unknown preset {preset!r}", err=True)
         raise typer.Exit(1)
+    if codec and codec not in ("h264", "h265"):
+        typer.echo("--codec must be h264 or h265", err=True)
+        raise typer.Exit(1)
+    if audio not in ("preset", "copy", "aac", "none"):
+        typer.echo("--audio must be preset, copy, aac, or none", err=True)
+        raise typer.Exit(1)
 
     console = Console(no_color=plain)
     check_ffmpeg(console)
 
-    preset_cfg: dict[str, Any] = {**PRESETS[preset]}
-    if crf is not None:
-        if not 0 <= crf <= 51:
-            console.print("[red]CRF must be 0–51[/red]")
-            raise typer.Exit(1)
-        preset_cfg["crf"] = crf
-    if codec:
-        preset_cfg["video_codec"] = "libx264" if codec == "h264" else "libx265"
+    try:
+        preset_cfg = apply_encode_overrides(
+            {**PRESETS[preset]},
+            crf=crf,
+            codec=codec,
+            ffmpeg_preset=ffmpeg_preset,
+            audio_mode=audio,
+            audio_bitrate=audio_bitrate,
+            container=container,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
 
     pending: dict[str, float] = {}
     lock = threading.Lock()
@@ -1158,7 +1393,8 @@ def watch_cmd(
     observer.start()
     console.print(Panel.fit(
         f"[bold]Watching[/bold] [cyan]{directory.resolve()}[/cyan]\n"
-        f"preset=[magenta]{preset}[/magenta]  output_dir={output_dir or '[dim]same as file[/dim]'}\n"
+        f"preset=[magenta]{preset}[/magenta]  container=[magenta]{preset_cfg.get('container', 'mp4')}[/magenta]  "
+        f"output_dir={output_dir or '[dim]same as file[/dim]'}\n"
         "[dim]Ctrl+C to stop[/dim]",
         title="vopt watch",
         border_style="green",
